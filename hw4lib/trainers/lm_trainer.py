@@ -61,15 +61,7 @@ class LMTrainer(BaseTrainer):
     def _train_epoch(self, dataloader) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         """
         Train for one epoch.
-        
-        Args:
-            dataloader: DataLoader for training data
-        Returns:
-            Tuple[Dict[str, float], Dict[str, torch.Tensor]]: Training metrics and attention weights
         """
-
-        # TODO: In-fill the _train_epoch method
-        
         # Initialize training variables
         self.model.train()
         batch_bar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc=f"[Training LM]")
@@ -80,34 +72,28 @@ class LMTrainer(BaseTrainer):
         self.optimizer.zero_grad()
 
         for i, batch in enumerate(dataloader):
-            # TODO: Unpack batch from the dataloader
-            # TODO: Move the batch elements to self.device
+            # Unpack batch from the dataloader
             targets_shifted, targets_golden, lengths = batch
-        
+            
+            # Move the batch elements to self.device BEFORE the autocast block
+            targets_shifted = targets_shifted.to(self.device)
+            targets_golden = targets_golden.to(self.device)
+            lengths = lengths.to(self.device)
 
             with torch.autocast(device_type=self.device, dtype=torch.float16):
-
-                # TODO: Get raw logits and attention weights from model
-                raw_preds, attn_weights = NotImplementedError
                 
-                # Move the batch elements to self.device
-                targets_shifted = targets_shifted.to(self.device)
-                targets_golden = targets_golden.to(self.device)
-                lengths = lengths.to(self.device)
+                # Get raw logits and attention weights from model
+                raw_preds, attn_weights = self.model(targets_shifted, lengths)
 
-                with torch.autocast(device_type=self.device, dtype=torch.float16):
-                    raw_preds, attn_weights = self.model(targets_shifted, lengths)
-
-                # TODO: Calculate raw loss first
-                # What is the shape of raw_preds and targets_golden? 
-                # Would you need to change the shape of the inputs to the criterion?
-                # Hint: See the documentation for CrossEntropyLoss
-                    raw_loss = self.criterion(
-                        raw_preds.view(-1, self.model.num_classes), 
-                        targets_golden.view(-1)
-                    )
+                # Calculate raw loss first
+                # Flatten logits: (Batch * Seq_Len, Vocab_Size)
+                # Flatten targets: (Batch * Seq_Len)
+                raw_loss = self.criterion(
+                    raw_preds.view(-1, self.model.num_classes), 
+                    targets_golden.view(-1)
+                )
                 
-            # Calculate metrics with raw loss (DO NOT MODIFY THIS)
+            # Calculate metrics with raw loss
             batch_tokens = lengths.sum().item()
             total_tokens += batch_tokens
             running_ce_loss += raw_loss.item() * batch_tokens
@@ -115,7 +101,7 @@ class LMTrainer(BaseTrainer):
             # Normalize loss for gradient accumulation
             loss = raw_loss / self.config['training']['gradient_accumulation_steps']
             
-            # TODO: Backpropagate the loss
+            # Backpropagate the loss
             self.scaler.scale(loss).backward()
         
             # Only update weights after accumulating enough gradients
@@ -144,84 +130,10 @@ class LMTrainer(BaseTrainer):
         # Handle any remaining gradients at the end of the epoch
         if (len(dataloader) % self.config['training']['gradient_accumulation_steps']) != 0:
             self.scaler.step(self.optimizer)
-            # Only step scheduler here if it's not ReduceLROnPlateau
             if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step()
             self.scaler.update()
             self.optimizer.zero_grad()
-
-        # Compute final metrics
-        avg_ce_loss = running_ce_loss / total_tokens
-        avg_ce_loss_char = avg_ce_loss / dataloader.dataset.get_avg_chars_per_token()
-        avg_perplexity_token = torch.exp(torch.tensor(avg_ce_loss))
-        avg_perplexity_char = torch.exp(torch.tensor(avg_ce_loss_char))
-        batch_bar.close()
-
-        return {
-            'ce_loss_token': avg_ce_loss,
-            'ce_loss_char': avg_ce_loss_char,
-            'perplexity_token': avg_perplexity_token.item(),
-            'perplexity_char': avg_perplexity_char.item()
-        }, attn_weights
-            
-            
-    def _validate_epoch(self, dataloader):
-        """
-        Validate for one epoch.
-        
-        Args:
-            dataloader: DataLoader for validation data
-        Returns:
-            Tuple[Dict[str, float], Dict[str, torch.Tensor]]: Validation metrics and attention weights
-        """
-
-        # TODO: In-fill the _validate_epoch method
-        
-        # Initialize validation variables
-        self.model.eval()
-        batch_bar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc=f"[Validating LM]")
-        running_ce_loss = 0.0
-        total_tokens = 0
-
-        for i, batch in enumerate(dataloader):
-            # TODO: Unpack batch
-            # TODO: Move the batch elements to self.device
-            targets_shifted, targets_golden, lengths = batch
-            targets_shifted = targets_shifted.to(self.device)
-            targets_golden = targets_golden.to(self.device)
-            lengths = lengths.to(self.device)
-
-            # Forward pass
-            with torch.inference_mode():
-                # TODO: Get raw predictions and attention weights from model
-                raw_preds, attn_weights = self.model(targets_shifted, lengths)
-
-                # TODO: Calculate loss
-                # What is the shape of raw_preds and targets_golden? 
-                # Would you need to change the shape of the inputs to the criterion?
-                # Hint: See the documentation for CrossEntropyLoss
-                loss = self.criterion(
-                    raw_preds.view(-1, self.model.num_classes),
-                    targets_golden.view(-1)
-                )
-
-            # Calculate metrics
-            batch_tokens = lengths.sum().item()
-            total_tokens += batch_tokens
-            running_ce_loss += loss.item() * batch_tokens
-
-            # Update the progress bar
-            avg_ce_loss = running_ce_loss / total_tokens
-            perplexity_token = torch.exp(torch.tensor(avg_ce_loss))
-            batch_bar.set_postfix(
-                ce_loss_token=f"{avg_ce_loss:.4f}",
-                perplexity_token=f"{perplexity_token:.4f}",
-            )
-            batch_bar.update()
-
-            # Clean up
-            del targets_shifted, targets_golden, lengths, raw_preds, loss
-            torch.cuda.empty_cache()
 
         # Compute final metrics
         avg_ce_loss = running_ce_loss / total_tokens
