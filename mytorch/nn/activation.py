@@ -23,9 +23,15 @@ class Softmax:
         # TODO: Implement forward pass
         # Compute the softmax in a numerically stable way
         # Apply it to the dimension specified by the `dim` parameter
-        self.A = NotImplementedError
-        raise NotImplementedError
-
+        Z_max = np.max(Z, axis=self.dim, keepdims=True)
+        Z_stable = Z - Z_max
+        exp_Z = np.exp(Z_stable)
+        sum_exp_Z = np.sum(exp_Z, axis=self.dim, keepdims=True)
+        
+        self.A = exp_Z / sum_exp_Z
+        
+        return self.A
+    
     def backward(self, dLdA):
         """
         :param dLdA: Gradient of loss wrt output
@@ -40,16 +46,29 @@ class Softmax:
            
         # Reshape input to 2D
         if len(shape) > 2:
-            self.A = NotImplementedError
-            dLdA = NotImplementedError
+            self.A = np.swapaxes(self.A, self.dim, -1)
+            dLdA = np.swapaxes(dLdA, self.dim, -1)
+            
+            self.A = self.A.reshape(-1, C)
+            dLdA = dLdA.reshape(-1, C)
+
+        prod = dLdA * self.A
+        sum_prod = np.sum(prod, axis=1, keepdims=True)
+        dLdZ = prod - (self.A * sum_prod)
 
         # Reshape back to original dimensions if necessary
         if len(shape) > 2:
             # Restore shapes to original
-            self.A = NotImplementedError
-            dLdZ = NotImplementedError
+            swapped_shape = list(shape)
+            swapped_shape[self.dim], swapped_shape[-1] = swapped_shape[-1], swapped_shape[self.dim]
+        
+            self.A = self.A.reshape(swapped_shape)
+            dLdZ = dLdZ.reshape(swapped_shape)
+            
+            self.A = np.swapaxes(self.A, self.dim, -1)
+            dLdZ = np.swapaxes(dLdZ, self.dim, -1)
 
-        raise NotImplementedError
+        return dLdZ
  
 
     

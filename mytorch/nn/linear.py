@@ -31,8 +31,19 @@ class Linear:
         
         # Store input for backward pass
         self.A = A
+        self.input_shape = A.shape
         
-        raise NotImplementedError
+        batch_size = np.prod(self.input_shape[:-1])
+        in_features = self.input_shape[-1]
+        
+        A_flat = A.reshape(batch_size, in_features)
+        Z_flat = np.dot(A_flat, self.W.T) + self.b
+        out_features = self.W.shape[0]
+        output_shape = self.input_shape[:-1] + (out_features,)
+        
+        Z = Z_flat.reshape(output_shape)
+        
+        return Z
 
     def backward(self, dLdZ):
         """
@@ -41,11 +52,15 @@ class Linear:
         """
         # TODO: Implement backward pass
 
-        # Compute gradients (refer to the equations in the writeup)
-        self.dLdA = NotImplementedError
-        self.dLdW = NotImplementedError
-        self.dLdb = NotImplementedError
-        self.dLdA = NotImplementedError
+        batch_size = np.prod(dLdZ.shape[:-1])
+        out_features = dLdZ.shape[-1]
+        dLdZ_flat = dLdZ.reshape(batch_size, out_features)
+        in_features = self.input_shape[-1]
+        A_flat = self.A.reshape(batch_size, in_features)
+
+        dLdA_flat = np.dot(dLdZ_flat, self.W)
+        self.dLdW = np.dot(dLdZ_flat.T, A_flat)
+        self.dLdb = np.sum(dLdZ_flat, axis=0)
+        self.dLdA = dLdA_flat.reshape(self.input_shape)
         
-        # Return gradient of loss wrt input
-        raise NotImplementedError
+        return self.dLdA
