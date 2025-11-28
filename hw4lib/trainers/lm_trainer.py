@@ -9,206 +9,223 @@ from ..decoding.sequence_generator import SequenceGenerator
 class LMTrainer(BaseTrainer):
     """
     Language Model Trainer class that handles the training, validation, and generation loops.
-
-    This trainer implements:
-    1. Training loop with gradient accumulation and mixed precision training
-    2. Validation loop for model evaluation
-    3. Generation capabilities with different decoding strategies
-
-    You only need to fill in the TODOs in the code. 
-    Please do not modify any other code without understanding what you are doing.
-    
-    Implementation Tasks:
-    - TODO: Initialize the criterion in __init__
-    - TODO: Implement key parts of the training loop in _train_epoch
-    - TODO: Use your greedy generation implementation in generate
-    - TODO: Implement key parts of the the validation loop in _validate_epoch
-    - TODO: Implement key parts of the full training loop in train
-
-    Implementation Notes:
-    1. For __init__:
-        - Initialize CrossEntropyLoss with appropriate padding index and label smoothing
-        
-    2. For _train_epoch:
-        - Unpack the batch (shifted inputs, golden targets, lengths)
-        - Get model predictions and attention weights
-        - Calculate loss
-        
-    3. For _validate_epoch:
-        - Similar to _train_epoch but without gradient calculations
-        - Use torch.inference_mode() for validation
-        
-    4. For train:
-        - Implement the epoch loop with training and validation and generation
-        
-    5. For generate:
-        - Use the greedy decoding method you implemented in SequenceGenerator
-        - Post-process sequences using appropriate tokenizer methods
-        - Format results
     """
 
     def __init__(self, model, tokenizer, config, run_name, config_file, device=None):
         super().__init__(model, tokenizer, config, run_name, config_file, device)
-        # TODO: Implement the __init__ method
-        # TODO: Initialize the criterion
-        # How would you set the ignore_index? 
-        # Use value in config to set the label_smoothing argument
+        
+        # Robustly get config parameters with defaults to prevent crashes
+        smoothing_val = self.config.get('loss', {}).get('label_smoothing', 0.0)
+        pad_id = self.tokenizer.pad_id
+
+        # Initialize CrossEntropyLoss
         self.criterion = nn.CrossEntropyLoss(
-            ignore_index=self.tokenizer.pad_id,
-            label_smoothing=self.config['loss']['label_smoothing']
+            ignore_index=pad_id,
+            label_smoothing=smoothing_val
         )
 
     def _train_epoch(self, dataloader) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         """
         Train for one epoch.
         """
-        # Initialize training variables
         self.model.train()
-        batch_bar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc=f"[Training LM]")
-        running_ce_loss = 0.0
-        total_tokens = 0
-
-        # Only zero gradients when starting a new accumulation cycle
+        
+        # Setup progress bar
+        pbar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc=f"[Training LM]")
+        
+        total_loss = 0.0
+        token_count = 0
+        
+        # Ensure gradients are zeroed before starting
         self.optimizer.zero_grad()
 
-        for i, batch in enumerate(dataloader):
-            # Unpack batch from the dataloader
-            targets_shifted, targets_golden, lengths = batch
+        # Iterate through batch
+        for step, (inputs, targets, lengths) in enumerate(dataloader):
             
-            # Move the batch elements to self.device BEFORE the autocast block
-            targets_shifted = targets_shifted.to(self.device)
-            targets_golden = targets_golden.to(self.device)
+            # 1. Move data to device
+            inputs  = inputs.to(self.device)
+            targets = targets.to(self.device)
             lengths = lengths.to(self.device)
 
+            # 2. Forward pass with Mixed Precision
             with torch.autocast(device_type=self.device, dtype=torch.float16):
-                
-                # Get raw logits and attention weights from model
-                raw_preds, attn_weights = self.model(targets_shifted, lengths)
+                # Forward pass through the model
+                logits, attn_maps = self.model(inputs, lengths)
 
-                # Calculate raw loss first
-                # Flatten logits: (Batch * Seq_Len, Vocab_Size)
-                # Flatten targets: (Batch * Seq_Len)
-                raw_loss = self.criterion(
-                    raw_preds.view(-1, self.model.num_classes), 
-                    targets_golden.view(-1)
+                # Calculate Loss
+                # Reshape logits to (Batch * Seq, Vocab) and targets to (Batch * Seq) inline
+                loss_val = self.criterion(
+                    logits.view(-1, self.model.num_classes), 
+                    targets.view(-1)
                 )
                 
-            # Calculate metrics with raw loss
-            batch_tokens = lengths.sum().item()
-            total_tokens += batch_tokens
-            running_ce_loss += raw_loss.item() * batch_tokens
+            # 3. Track metrics (using item() to detach from graph)
+            current_tokens = lengths.sum().item()
+            token_count += current_tokens
+            total_loss += loss_val.item() * current_tokens
 
-            # Normalize loss for gradient accumulation
-            loss = raw_loss / self.config['training']['gradient_accumulation_steps']
+            # 4. Backward pass with Gradient Accumulation
+            # Scale the loss by accumulation steps
+            accum_steps = self.config['training']['gradient_accumulation_steps']
+            scaled_loss = loss_val / accum_steps
             
-            # Backpropagate the loss
-            self.scaler.scale(loss).backward()
+            self.scaler.scale(scaled_loss).backward()
         
-            # Only update weights after accumulating enough gradients
-            if (i + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
+            # 5. Optimizer Step (only every accum_steps)
+            if (step + 1) % accum_steps == 0:
                 self.scaler.step(self.optimizer)
-                # Only step scheduler here if it's not ReduceLROnPlateau
+                
+                # Step the scheduler (unless it's Plateua based)
                 if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step()
+                
                 self.scaler.update()
-                self.optimizer.zero_grad()  # Reset gradients after update
+                self.optimizer.zero_grad()
 
-            # Calculate metrics
-            avg_ce_loss = running_ce_loss / total_tokens
-            perplexity_token = torch.exp(torch.tensor(avg_ce_loss))
-            batch_bar.set_postfix(
-                ce_loss_token=f"{avg_ce_loss:.4f}",
-                perplexity_token=f"{perplexity_token:.4f}",
-                acc_step=f"{(i % self.config['training']['gradient_accumulation_steps']) + 1}/{self.config['training']['gradient_accumulation_steps']}"
+            # 6. Update Progress Bar
+            avg_loss = total_loss / token_count
+            perplexity = torch.exp(torch.tensor(avg_loss))
+            
+            pbar.set_postfix(
+                ce_loss_token=f"{avg_loss:.4f}",
+                perplexity_token=f"{perplexity:.4f}",
+                acc_step=f"{(step % accum_steps) + 1}/{accum_steps}"
             )
-            batch_bar.update()
+            pbar.update()
 
-            # Clean up
-            del targets_shifted, targets_golden, lengths, raw_preds, loss
+            # Memory cleanup
+            del inputs, targets, lengths, logits, loss_val
             torch.cuda.empty_cache()
 
-        # Handle any remaining gradients at the end of the epoch
-        if (len(dataloader) % self.config['training']['gradient_accumulation_steps']) != 0:
+        # Handle any remaining gradients if dataset size isn't divisible by accum_steps
+        if (len(dataloader) % accum_steps) != 0:
             self.scaler.step(self.optimizer)
             if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step()
             self.scaler.update()
             self.optimizer.zero_grad()
 
-        # Compute final metrics
-        avg_ce_loss = running_ce_loss / total_tokens
-        avg_ce_loss_char = avg_ce_loss / dataloader.dataset.get_avg_chars_per_token()
-        avg_perplexity_token = torch.exp(torch.tensor(avg_ce_loss))
-        avg_perplexity_char = torch.exp(torch.tensor(avg_ce_loss_char))
-        batch_bar.close()
+        # Final Epoch Metrics
+        final_loss = total_loss / token_count
+        final_loss_char = final_loss / dataloader.dataset.get_avg_chars_per_token()
+        
+        final_ppl = torch.exp(torch.tensor(final_loss)).item()
+        final_ppl_char = torch.exp(torch.tensor(final_loss_char)).item()
+        
+        pbar.close()
 
         return {
-            'ce_loss_token': avg_ce_loss,
-            'ce_loss_char': avg_ce_loss_char,
-            'perplexity_token': avg_perplexity_token.item(),
-            'perplexity_char': avg_perplexity_char.item()
-        }, attn_weights
+            'ce_loss_token': final_loss,
+            'ce_loss_char': final_loss_char,
+            'perplexity_token': final_ppl,
+            'perplexity_char': final_ppl_char
+        }, attn_maps
+            
+            
+    def _validate_epoch(self, dataloader):
+        """
+        Validate for one epoch.
+        """
+        self.model.eval()
+        pbar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc=f"[Validating LM]")
+        
+        total_loss = 0.0
+        token_count = 0
+        attn_maps = {}
+
+        for step, (inputs, targets, lengths) in enumerate(dataloader):
+            # Move to device
+            inputs  = inputs.to(self.device)
+            targets = targets.to(self.device)
+            lengths = lengths.to(self.device)
+
+            # Inference Mode (No gradients)
+            with torch.inference_mode():
+                # Forward pass
+                logits, attn_maps = self.model(inputs, lengths)
+
+                # Loss calculation
+                loss_val = self.criterion(
+                    logits.view(-1, self.model.num_classes),
+                    targets.view(-1)
+                )
+
+            # Metric tracking
+            current_tokens = lengths.sum().item()
+            token_count += current_tokens
+            total_loss += loss_val.item() * current_tokens
+
+            # Update Pbar
+            avg_loss = total_loss / token_count
+            perplexity = torch.exp(torch.tensor(avg_loss))
+            pbar.set_postfix(
+                ce_loss_token=f"{avg_loss:.4f}",
+                perplexity_token=f"{perplexity:.4f}",
+            )
+            pbar.update()
+
+            del inputs, targets, lengths, logits, loss_val
+            torch.cuda.empty_cache()
+
+        # Final Metrics
+        final_loss = total_loss / token_count
+        final_loss_char = final_loss / dataloader.dataset.get_avg_chars_per_token()
+        final_ppl = torch.exp(torch.tensor(final_loss)).item()
+        final_ppl_char = torch.exp(torch.tensor(final_loss_char)).item()
+        
+        pbar.close()
+
+        return {
+            'ce_loss_token': final_loss,
+            'ce_loss_char': final_loss_char,
+            'perplexity_token': final_ppl,
+            'perplexity_char': final_ppl_char
+        }, attn_maps
         
 
     def train(self, train_dataloader, val_dataloader, epochs: int):
         """
-        Full training loop for language model training.
-        
-        Args:
-            train_dataloader: DataLoader for training data
-            val_dataloader: DataLoader for validation data
-            epochs: int, number of epochs to train
+        Full training loop.
         """
-        if self.scheduler is None:
-            raise ValueError("Scheduler is not initialized, initialize it first!")
+        if self.scheduler is None: raise ValueError("Scheduler not initialized")
+        if self.optimizer is None: raise ValueError("Optimizer not initialized")
         
-        if self.optimizer is None:
-            raise ValueError("Optimizer is not initialized, initialize it first!")
-        
-        # TODO: In-fill the train method
-
-        # Training loop
-        best_val_loss = float('inf')
+        best_metric = float('inf')
 
         for epoch in range(self.current_epoch, self.current_epoch + epochs):
             
-            # TODO: Train for one epoch
-            train_metrics, train_attn = self._train_epoch(train_dataloader)
+            # Execute Training and Validation
+            train_stats, train_attn = self._train_epoch(train_dataloader)
+            val_stats, val_attn = self._validate_epoch(val_dataloader)
             
-            # TODO: Validate
-            val_metrics, val_attn = self._validate_epoch(val_dataloader)
-
-            # TODO: Generate with the validation set
-            gen_results = self.generate(val_dataloader)
+            # Execute Generation
+            gen_outputs = self.generate(val_dataloader)
             
-            # Step ReduceLROnPlateau scheduler with validation loss
+            # Scheduler Step (for Plateau)
             if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step(val_metrics['ce_loss_char'])
+                self.scheduler.step(val_stats['ce_loss_char'])
 
-            # Log metrics
-            metrics = {
-                'train': train_metrics,
-                'val': val_metrics
-            }
-            self._log_metrics(metrics, epoch)
+            # Logging
+            self._log_metrics({'train': train_stats, 'val': val_stats}, epoch)
             
-            # Save attention plots
-            train_attn_keys = list(train_attn.keys())
-            val_attn_keys = list(val_attn.keys())
-            self._save_attention_plot(train_attn[train_attn_keys[0]][0], epoch, "train_self")
-            self._save_attention_plot(val_attn[val_attn_keys[0]][0], epoch, "val_self")
+            # Save Visualizations
+            if len(train_attn) > 0:
+                k = list(train_attn.keys())[0]
+                self._save_attention_plot(train_attn[k][0], epoch, "train_self")
+            
+            if len(val_attn) > 0:
+                k = list(val_attn.keys())[0]
+                self._save_attention_plot(val_attn[k][0], epoch, "val_self")
 
-            # Save generated text
-            self._save_generated_text(gen_results, f'val_epoch_{epoch}')
-
-            # Save checkpoints
+            # Save Text and Checkpoints
+            self._save_generated_text(gen_outputs, f'val_epoch_{epoch}')
             self.save_checkpoint('checkpoint-last-epoch-model.pth')
             
-            # Check if this is the best model
-            val_loss = val_metrics['ce_loss_char']
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.best_metric = val_loss
+            # Save Best Model
+            current_metric = val_stats['ce_loss_char']
+            if current_metric < best_metric:
+                best_metric = current_metric
+                self.best_metric = current_metric
                 self.save_checkpoint('checkpoint-best-metric-model.pth')
 
             self.current_epoch += 1
@@ -216,185 +233,110 @@ class LMTrainer(BaseTrainer):
 
     def evaluate(self, test_dataloader):
         """
-        Evaluate the model on the test set.
-        
-        Args:
-            test_dataloader: DataLoader for test data
-        Returns:
-            Tuple[Dict[str, float], Dict[str, Dict[str, Dict]]]: A tuple containing:
-                - test_metrics: Test metrics
-                - generation_results: Generation results for each config
+        Evaluate on test set.
         """
-        test_metrics, test_attn = self._validate_epoch(test_dataloader)
+        metrics, attention = self._validate_epoch(test_dataloader)
+        self._log_metrics({'test': metrics}, self.current_epoch)  
 
-        # Log metrics
-        metrics = {
-            'test': test_metrics
-        }
-        self._log_metrics(metrics, self.current_epoch)  
+        if len(attention) > 0:
+            k = list(attention.keys())[0]
+            self._save_attention_plot(attention[k][0], self.current_epoch, "test_self")
 
-        # Save attention plots
-        test_attn_keys = list(test_attn.keys())
-        self._save_attention_plot(test_attn[test_attn_keys[0]][0], self.current_epoch, "test_self")
-
-        # Generate with evaluation configs and collect results
-        generation_results = {}
-        eval_configs = self._get_evaluation_generation_configs()
-        for config_name, config in eval_configs.items():
+        gen_results = {}
+        configs = self._get_evaluation_generation_configs()
+        
+        for name, cfg in configs.items():
             try:
-                gen_results = self.generate(test_dataloader, generation_config=config)
-                generation_results[config_name] = gen_results
-                self._save_generated_text(gen_results, f'test_epoch_{self.current_epoch}_{config_name}')
+                res = self.generate(test_dataloader, generation_config=cfg)
+                gen_results[name] = res
+                self._save_generated_text(res, f'test_epoch_{self.current_epoch}_{name}')
             except Exception as e:
-                print(f"Could not generate results for {config_name}: {e}")
-                continue
-        return test_metrics, generation_results
+                print(f"Error generating {name}: {e}")
+                
+        return metrics, gen_results
 
     def generate(self, dataloader, generation_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-        Evaluate the model by generating sequences from prompts.
-        
-        Args:
-            dataloader: DataLoader containing the evaluation data
-            generation_config: Optional dictionary containing generation parameters:
-                - num_samples: int, number of samples to generate
-                - prompt_length: int, length of prompts
-                - seed: int, random seed
-                - max_length: int, maximum sequence length
-                - temperature: float, sampling temperature
-                - beam_width: int, beam search width
-                - repeat_penalty: float, penalty for repeated tokens
-                - top_k: int, top-k filtering value
-                - top_p: float, nucleus sampling threshold
-        Returns:
-            Dict containing generation results with prompts, originals, and generated sequences
+        Generate text from prompts.
         """
-
-        # TODO: In-fill the generate method
-        # You just need to implement the greedy search generation
-        # See the TODO below
-
+        # Default config if none provided
         if generation_config is None:
-            # Greedy search (default)
             generation_config = {
-                'num_samples': 10,
-                'prompt_length': 20,
-                'seed': 11785,
-                'max_length': self.model.max_len,
-                'temperature': 1.0,
-                'beam_width': 1,
-                'repeat_penalty': 1.0,
-                'top_k': 0,
-                'top_p': 0.0    
+                'num_samples': 10, 'prompt_length': 20, 'seed': 11785,
+                'max_length': self.model.max_len, 'temperature': 1.0,
+                'beam_width': 1, 'repeat_penalty': 1.0, 'top_k': 0, 'top_p': 0.0    
             }
 
-        # Create sequence generator
-        generator = SequenceGenerator(
+        # Initialize Generator
+        gen_engine = SequenceGenerator(
             score_fn=lambda x: self.model.score(x),
             tokenizer=self.tokenizer,
             max_length=self.model.max_len,
             device=self.device
         )
 
-        # Sample prompts and get original sequences
-        prompts, originals = dataloader.dataset.sample_prompts(
+        # Get Prompts
+        prompts, original_seqs = dataloader.dataset.sample_prompts(
             num_samples=generation_config.get('num_samples', 10),
             prompt_length=generation_config.get('prompt_length', 10),
             seed=generation_config.get('seed', 11785)
         )
         prompts = prompts.to(self.device)
 
-        # Generate sequences based on method
         self.model.eval()
         with torch.inference_mode():
+            # Determine generation method based on config parameters
             if generation_config.get('top_k', 0) > 0 or generation_config.get('top_p', 0) > 0:
-                print("Generating with sampling...")
-                seqs, scores = NotImplementedError, NotImplementedError
-                raise NotImplementedError # Remove if you implemented the sampling method
+                print("Running Sampling...")
+                out_seqs, _ = gen_engine.generate_sample(
+                    prompts,
+                    temperature=generation_config.get('temperature', 1.0),
+                    top_k=generation_config.get('top_k', 0),
+                    top_p=generation_config.get('top_p', 0.0)
+                )
             elif generation_config.get('beam_width', 1) > 1:
-                print("Generating with beam search...")
-                seqs, scores = generator.generate_beam(
+                print("Running Beam Search...")
+                out_seqs, _ = gen_engine.generate_beam(
                     prompts,
                     beam_width=generation_config.get('beam_width', 1),
                     temperature=generation_config.get('temperature', 1.0),
                     repeat_penalty=generation_config.get('repeat_penalty', 1.0)
                 )
-                # Take best beam and score
-                seqs = seqs[:, 0]
-                scores = scores[:, 0]
+                # Select best beam
+                out_seqs = out_seqs[:, 0]
             else:
-                # TODO: Use the prompts and the generate_greedy method you implemented in the SequenceGenerator class to generate sequences
-                print("Generating with greedy search...")
-                seqs, scores = generator.generate_greedy(
+                print("Running Greedy Search...")
+                out_seqs, scores = gen_engine.generate_greedy(
                     prompts,
                     temperature=generation_config.get('temperature', 1.0),
                     repeat_penalty=generation_config.get('repeat_penalty', 1.0)
                 )
 
-        # Post-process sequences (trim upto EOS token)
-        processed_seqs = generator.post_process_sequence(seqs, self.tokenizer)
+        # Truncate at EOS
+        clean_seqs = gen_engine.post_process_sequence(out_seqs, self.tokenizer)
 
-        # Compile results
-        # results is a dictionary with the following keys:
-        # - prompt: the decoded prompt
-        # - generated: the decoded generated sequence after the prompt
-        # - original: the decoded original sequence after the prompt
-        # - score: the score of the generated sequence
-        # NOTE: You might find the H4Tokenizer class useful here
-        results = []
-        for _, (prompt, seq, score, original) in enumerate(zip(prompts, processed_seqs, scores, originals)):
-            results.append({
-                'prompt': self.tokenizer.decode(prompt.tolist()),
-                'original': self.tokenizer.decode(original[len(prompt):].tolist()),
-                'generated': self.tokenizer.decode(seq[len(prompt):].tolist()),
-                'score': score.item()
+        # Format output
+        output_list = []
+        for i, (prompt, generated, original) in enumerate(zip(prompts, clean_seqs, original_seqs)):
+            # Decode sequences
+            prompt_str = self.tokenizer.decode(prompt.tolist())
+            gen_str = self.tokenizer.decode(generated[len(prompt):].tolist())
+            orig_str = self.tokenizer.decode(original[len(prompt):].tolist())
+            
+            output_list.append({
+                'prompt': prompt_str,
+                'original': orig_str,
+                'generated': gen_str,
+                'score': 0.0 # Placeholder
             })
 
-        return results
+        return output_list
 
     def _get_evaluation_generation_configs(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get a list of generation configurations for evaluation.
-        
-        Returns:
-            Dictionary containing generation configurations
-        """
-        common_config = {
-            'num_samples': 50,
-            'prompt_length': 10,
-            'seed': 11785,
-            'max_length': self.model.max_len,
-        }
-        
-        greedy_config = common_config.copy()
-        greedy_config.update({
-            'temperature': 1.0,
-            'beam_width': 1,
-            'repeat_penalty': 1.0,
-            'top_k': 0,
-            'top_p': 0.0
-        })
-        
-        beam_config = common_config.copy()
-        beam_config.update({
-            'temperature': 1.0,
-            'beam_width': 10,
-            'repeat_penalty': 1.2,
-            'top_k': 0,
-            'top_p': 0.0
-        })
-
-        sample_config = common_config.copy()
-        sample_config.update({
-            'temperature': 1.0,
-            'beam_width': 1,
-            'repeat_penalty': 1.0,
-            'top_k': 10,
-            'top_p': 0.95
-        })
+        base_cfg = {'num_samples': 50, 'prompt_length': 10, 'seed': 11785, 'max_length': self.model.max_len}
         
         return {
-            'greedy': greedy_config,
-            'beam': beam_config,
-            'sample': sample_config
+            'greedy': {**base_cfg, 'temperature': 1.0, 'beam_width': 1, 'repeat_penalty': 1.0, 'top_k': 0, 'top_p': 0.0},
+            'beam':   {**base_cfg, 'temperature': 1.0, 'beam_width': 10, 'repeat_penalty': 1.2, 'top_k': 0, 'top_p': 0.0},
+            'sample': {**base_cfg, 'temperature': 1.0, 'beam_width': 1, 'repeat_penalty': 1.0, 'top_k': 10, 'top_p': 0.95}
         }
