@@ -96,16 +96,16 @@ class LMTrainer(BaseTrainer):
                 lengths = lengths.to(self.device)
 
                 with torch.autocast(device_type=self.device, dtype=torch.float16):
-                raw_preds, attn_weights = self.model(targets_shifted, lengths)
+                    raw_preds, attn_weights = self.model(targets_shifted, lengths)
 
                 # TODO: Calculate raw loss first
                 # What is the shape of raw_preds and targets_golden? 
                 # Would you need to change the shape of the inputs to the criterion?
                 # Hint: See the documentation for CrossEntropyLoss
-                raw_loss = self.criterion(
-                    raw_preds.view(-1, self.model.num_classes), 
-                    targets_golden.view(-1)
-                )
+                    raw_loss = self.criterion(
+                        raw_preds.view(-1, self.model.num_classes), 
+                        targets_golden.view(-1)
+                    )
                 
             # Calculate metrics with raw loss (DO NOT MODIFY THIS)
             batch_tokens = lengths.sum().item()
